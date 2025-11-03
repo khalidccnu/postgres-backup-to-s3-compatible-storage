@@ -1,0 +1,178 @@
+name: Postgres Backup to S3-Compatible Storage
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+    - cron: "0 9 * * *"
+
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install PostgreSQL client and AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq python3-pip
+
+          # Install AWS CLI via pip
+          pip3 install awscli --upgrade --user
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+          # Add PostgreSQL APT repository for version 17
+          sudo sh -c 'echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          sudo apt-get update
+
+          # Install PostgreSQL 17 client
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Create .dump backup
+        run: |
+          export PGPASSWORD=${{ secrets.PGPASSWORD }}
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          FILE="backup_${TIMESTAMP}.dump"
+
+          echo "=========================================="
+          echo "📦 Creating PostgreSQL Backup"
+          echo "=========================================="
+          echo "Host: ${{ secrets.PGHOST }}"
+          echo "Port: ${{ secrets.PGPORT }}"
+          echo "Database: ${{ secrets.PGDATABASE }}"
+          echo "Schema: ${{ secrets.PGSCHEMA }}"
+          echo "Backup file: $FILE"
+          echo "Timestamp: $TIMESTAMP"
+          echo "=========================================="
+
+          pg_dump \
+            -h ${{ secrets.PGHOST }} \
+            -p ${{ secrets.PGPORT }} \
+            -U ${{ secrets.PGUSER }} \
+            -d ${{ secrets.PGDATABASE }} \
+            -n ${{ secrets.PGSCHEMA }} \
+            --exclude-table=${{ secrets.PGSCHEMA }}.${{ secrets.PGMIGRATION_TABLE }} \
+            --exclude-table=${{ secrets.PGSCHEMA }}.${{ secrets.PGMIGRATION_TABLE }}_id_seq \
+            -F c -v -f $FILE
+
+          echo ""
+          echo "✅ Backup created successfully!"
+          echo "File size: $(du -h $FILE | cut -f1)"
+          echo "BACKUP_FILE=$FILE" >> $GITHUB_ENV
+
+      - name: Configure AWS CLI for S3-compatible storage
+        run: |
+          echo "=========================================="
+          echo "🔧 Configuring AWS CLI for S3"
+          echo "=========================================="
+          echo "S3 Endpoint: ${{ secrets.S3_ENDPOINT }}"
+          echo "S3 Region: ${{ secrets.S3_REGION }}"
+          echo ""
+
+          # Configure AWS CLI
+          aws configure set aws_access_key_id "${{ secrets.S3_ACCESS_KEY }}"
+          aws configure set aws_secret_access_key "${{ secrets.S3_SECRET_KEY }}"
+          aws configure set default.region "${{ secrets.S3_REGION }}"
+          aws configure set default.s3.signature_version s3v4
+
+          echo "✅ AWS CLI configured successfully!"
+
+      - name: Upload file to S3-compatible storage
+        run: |
+          FILE=${BACKUP_FILE}
+          echo "=========================================="
+          echo "☁️ Uploading to S3 Storage"
+          echo "=========================================="
+          echo "File: $FILE"
+          echo "Size: $(du -h $FILE | cut -f1)"
+          echo "Destination bucket: ${{ secrets.S3_BUCKET }}"
+          echo "S3 Endpoint: ${{ secrets.S3_ENDPOINT }}"
+          echo ""
+          echo "Uploading..."
+
+          aws s3 cp "$FILE" \
+            "s3://${{ secrets.S3_BUCKET }}/$FILE" \
+            --endpoint-url "${{ secrets.S3_ENDPOINT }}" \
+            --region "${{ secrets.S3_REGION }}"
+
+          if [ $? -eq 0 ]; then
+            echo ""
+            echo "✅ Upload successful!"
+          else
+            echo ""
+            echo "❌ Upload failed"
+            exit 1
+          fi
+
+      - name: Cleanup old backups (older than 7 days) via S3
+        run: |
+          echo "=========================================="
+          echo "🧹 Cleaning up old backups"
+          echo "=========================================="
+          echo "Retention policy: Delete backups older than 7 days"
+          echo ""
+
+          BUCKET=${{ secrets.S3_BUCKET }}
+          ENDPOINT=${{ secrets.S3_ENDPOINT }}
+          REGION=${{ secrets.S3_REGION }}
+          CUTOFF_DATE=$(date -d '7 days ago' +%s)
+
+          echo "Fetching list of backup files from bucket: $BUCKET"
+
+          # List all objects in the bucket with timestamps
+          aws s3api list-objects-v2 \
+            --bucket "$BUCKET" \
+            --endpoint-url "$ENDPOINT" \
+            --region "$REGION" \
+            --query 'Contents[?contains(Key, `backup_`)].{Key:Key,LastModified:LastModified}' \
+            --output json > /tmp/files.json
+
+          if [ ! -s /tmp/files.json ] || [ "$(cat /tmp/files.json)" == "null" ]; then
+            echo "ℹ️  No backup files found in bucket"
+            exit 0
+          fi
+
+          TOTAL_FILES=$(jq 'length' /tmp/files.json)
+          echo "Total backup files in bucket: $TOTAL_FILES"
+          echo ""
+
+          DELETED_COUNT=0
+          KEPT_COUNT=0
+
+          # Process each file using a while loop with process substitution to preserve variables
+          while IFS= read -r item; do
+            FILE_KEY=$(echo "$item" | jq -r '.Key')
+            LAST_MODIFIED=$(echo "$item" | jq -r '.LastModified')
+            
+            # Convert LastModified to Unix timestamp
+            FILE_TS=$(date -d "$LAST_MODIFIED" +%s)
+            AGE_DAYS=$(( ($(date +%s) - FILE_TS) / 86400 ))
+            
+            if [ $FILE_TS -lt $CUTOFF_DATE ]; then
+              echo "🗑️  Deleting: $FILE_KEY (Age: $AGE_DAYS days, Modified: $LAST_MODIFIED)"
+              aws s3 rm "s3://$BUCKET/$FILE_KEY" --endpoint-url "$ENDPOINT" --region "$REGION"
+              DELETED_COUNT=$((DELETED_COUNT + 1))
+            else
+              echo "✅ Keeping: $FILE_KEY (Age: $AGE_DAYS days, Modified: $LAST_MODIFIED)"
+              KEPT_COUNT=$((KEPT_COUNT + 1))
+            fi
+          done < <(jq -c '.[]' /tmp/files.json)
+
+          echo ""
+          echo "=========================================="
+          echo "Cleanup Summary:"
+          echo "  - Files deleted: $DELETED_COUNT"
+          echo "  - Files kept: $KEPT_COUNT"
+          echo "=========================================="
+
+      - name: Done
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "✅ BACKUP WORKFLOW COMPLETED SUCCESSFULLY!"
+          echo "=========================================="
+          echo "Backup file: ${BACKUP_FILE}"
+          echo "Upload location: ${{ secrets.S3_BUCKET }}/${BACKUP_FILE}"
+          echo "Timestamp: $(date)"
+          echo "=========================================="
