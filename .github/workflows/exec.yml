@@ -2,8 +2,10 @@ name: Postgres Backup to S3-Compatible Storage
 
 on:
   schedule:
-    - cron: "0 3 * * *"
-    - cron: "0 9 * * *"
+    - cron: "0 4 * * *"
+    - cron: "0 8 * * *"
+    - cron: "0 12 * * *"
+    - cron: "0 16 * * *"
 
   workflow_dispatch:
 
@@ -33,7 +35,7 @@ jobs:
         run: |
           export PGPASSWORD=${{ secrets.PGPASSWORD }}
           TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-          FILE="backup_${TIMESTAMP}.dump"
+          FILE="backup_${PGDATABASE}_${TIMESTAMP}.dump"
 
           echo "=========================================="
           echo "📦 Creating PostgreSQL Backup"
@@ -61,12 +63,21 @@ jobs:
           echo "File size: $(du -h $FILE | cut -f1)"
           echo "BACKUP_FILE=$FILE" >> $GITHUB_ENV
 
-      - name: Configure AWS CLI for S3-compatible storage
+      - name: Configure AWS CLI for S3 storage
         run: |
+          ENDPOINT="${{ secrets.S3_ENDPOINT }}"
+
           echo "=========================================="
           echo "🔧 Configuring AWS CLI for S3"
           echo "=========================================="
-          echo "S3 Endpoint: ${{ secrets.S3_ENDPOINT }}"
+
+          if [ -n "$ENDPOINT" ]; then
+            echo "Storage Type: S3-Compatible Storage"
+            echo "S3 Endpoint: $ENDPOINT"
+          else
+            echo "Storage Type: AWS S3"
+          fi
+
           echo "S3 Region: ${{ secrets.S3_REGION }}"
           echo ""
 
@@ -76,57 +87,143 @@ jobs:
           aws configure set default.region "${{ secrets.S3_REGION }}"
           aws configure set default.s3.signature_version s3v4
 
+          # Enable path-style addressing for S3-compatible storage
+          if [ -n "$ENDPOINT" ]; then
+            aws configure set default.s3.addressing_style path
+            echo "Path-style addressing enabled for S3-compatible storage"
+          fi
+
           echo "✅ AWS CLI configured successfully!"
 
-      - name: Upload file to S3-compatible storage
+      - name: Upload file to S3 storage
         run: |
           FILE=${BACKUP_FILE}
+          PREFIX="${{ secrets.S3_PREFIX }}"
+          ENDPOINT="${{ secrets.S3_ENDPOINT }}"
+
+          # Remove trailing slash from prefix if present
+          PREFIX="${PREFIX%/}"
+
+          # Construct the S3 path
+          if [ -n "$PREFIX" ]; then
+            S3_PATH="${PREFIX}/${FILE}"
+          else
+            S3_PATH="${FILE}"
+          fi
+
           echo "=========================================="
           echo "☁️ Uploading to S3 Storage"
           echo "=========================================="
           echo "File: $FILE"
           echo "Size: $(du -h $FILE | cut -f1)"
           echo "Destination bucket: ${{ secrets.S3_BUCKET }}"
-          echo "S3 Endpoint: ${{ secrets.S3_ENDPOINT }}"
+
+          if [ -n "$ENDPOINT" ]; then
+            echo "Storage Type: S3-Compatible Storage"
+            echo "S3 Endpoint: $ENDPOINT"
+          else
+            echo "Storage Type: AWS S3"
+          fi
+
+          if [ -n "$PREFIX" ]; then
+            echo "S3 Prefix (folder): $PREFIX"
+          fi
+          echo "Full S3 Path: $S3_PATH"
           echo ""
           echo "Uploading..."
 
-          aws s3 cp "$FILE" \
-            "s3://${{ secrets.S3_BUCKET }}/$FILE" \
-            --endpoint-url "${{ secrets.S3_ENDPOINT }}" \
-            --region "${{ secrets.S3_REGION }}"
+          # Upload with or without endpoint URL
+          if [ -n "$ENDPOINT" ]; then
+            aws s3 cp "$FILE" \
+              "s3://${{ secrets.S3_BUCKET }}/${S3_PATH}" \
+              --endpoint-url "$ENDPOINT" \
+              --region "${{ secrets.S3_REGION }}"
+          else
+            aws s3 cp "$FILE" \
+              "s3://${{ secrets.S3_BUCKET }}/${S3_PATH}" \
+              --region "${{ secrets.S3_REGION }}"
+          fi
 
           if [ $? -eq 0 ]; then
             echo ""
             echo "✅ Upload successful!"
+            echo "S3_PATH=$S3_PATH" >> $GITHUB_ENV
           else
             echo ""
             echo "❌ Upload failed"
             exit 1
           fi
 
-      - name: Cleanup old backups (older than 7 days) via S3
+      - name: Cleanup old backups (older than retention days) via S3
         run: |
+          RETENTION_DAYS="${{ secrets.RETENTION_DAYS }}"
+
           echo "=========================================="
           echo "🧹 Cleaning up old backups"
           echo "=========================================="
-          echo "Retention policy: Delete backups older than 7 days"
+
+          # Skip deletion if retention is 0 or not provided
+          if [ -z "$RETENTION_DAYS" ] || [ "$RETENTION_DAYS" -eq 0 ]; then
+            echo "ℹ️  Retention policy: Disabled (RETENTION_DAYS is not set or is 0)"
+            echo "ℹ️  Skipping cleanup - all backups will be kept"
+            echo "=========================================="
+            exit 0
+          fi
+
+          echo "Retention policy: Delete backups older than $RETENTION_DAYS days"
           echo ""
 
           BUCKET=${{ secrets.S3_BUCKET }}
-          ENDPOINT=${{ secrets.S3_ENDPOINT }}
+          ENDPOINT="${{ secrets.S3_ENDPOINT }}"
           REGION=${{ secrets.S3_REGION }}
-          CUTOFF_DATE=$(date -d '7 days ago' +%s)
+          PREFIX="${{ secrets.S3_PREFIX }}"
+
+          # Remove trailing slash from prefix if present
+          PREFIX="${PREFIX%/}"
+
+          CUTOFF_DATE=$(date -d "$RETENTION_DAYS days ago" +%s)
 
           echo "Fetching list of backup files from bucket: $BUCKET"
+          if [ -n "$PREFIX" ]; then
+            echo "Searching in prefix (folder): $PREFIX"
+          fi
+          echo ""
 
-          # List all objects in the bucket with timestamps
-          aws s3api list-objects-v2 \
-            --bucket "$BUCKET" \
-            --endpoint-url "$ENDPOINT" \
-            --region "$REGION" \
-            --query 'Contents[?contains(Key, `backup_`)].{Key:Key,LastModified:LastModified}' \
-            --output json > /tmp/files.json
+          # List all objects in the bucket (or prefix) with timestamps
+          # Handle both AWS S3 and S3-compatible storage
+          if [ -n "$PREFIX" ]; then
+            if [ -n "$ENDPOINT" ]; then
+              aws s3api list-objects-v2 \
+                --bucket "$BUCKET" \
+                --prefix "${PREFIX}/" \
+                --endpoint-url "$ENDPOINT" \
+                --region "$REGION" \
+                --query 'Contents[?contains(Key, `backup_`)].{Key:Key,LastModified:LastModified}' \
+                --output json > /tmp/files.json
+            else
+              aws s3api list-objects-v2 \
+                --bucket "$BUCKET" \
+                --prefix "${PREFIX}/" \
+                --region "$REGION" \
+                --query 'Contents[?contains(Key, `backup_`)].{Key:Key,LastModified:LastModified}' \
+                --output json > /tmp/files.json
+            fi
+          else
+            if [ -n "$ENDPOINT" ]; then
+              aws s3api list-objects-v2 \
+                --bucket "$BUCKET" \
+                --endpoint-url "$ENDPOINT" \
+                --region "$REGION" \
+                --query 'Contents[?contains(Key, `backup_`)].{Key:Key,LastModified:LastModified}' \
+                --output json > /tmp/files.json
+            else
+              aws s3api list-objects-v2 \
+                --bucket "$BUCKET" \
+                --region "$REGION" \
+                --query 'Contents[?contains(Key, `backup_`)].{Key:Key,LastModified:LastModified}' \
+                --output json > /tmp/files.json
+            fi
+          fi
 
           if [ ! -s /tmp/files.json ] || [ "$(cat /tmp/files.json)" == "null" ]; then
             echo "ℹ️  No backup files found in bucket"
@@ -151,7 +248,14 @@ jobs:
             
             if [ $FILE_TS -lt $CUTOFF_DATE ]; then
               echo "🗑️  Deleting: $FILE_KEY (Age: $AGE_DAYS days, Modified: $LAST_MODIFIED)"
-              aws s3 rm "s3://$BUCKET/$FILE_KEY" --endpoint-url "$ENDPOINT" --region "$REGION"
+              
+              # Delete with or without endpoint URL
+              if [ -n "$ENDPOINT" ]; then
+                aws s3 rm "s3://$BUCKET/$FILE_KEY" --endpoint-url "$ENDPOINT" --region "$REGION"
+              else
+                aws s3 rm "s3://$BUCKET/$FILE_KEY" --region "$REGION"
+              fi
+              
               DELETED_COUNT=$((DELETED_COUNT + 1))
             else
               echo "✅ Keeping: $FILE_KEY (Age: $AGE_DAYS days, Modified: $LAST_MODIFIED)"
@@ -162,6 +266,7 @@ jobs:
           echo ""
           echo "=========================================="
           echo "Cleanup Summary:"
+          echo "  - Retention period: $RETENTION_DAYS days"
           echo "  - Files deleted: $DELETED_COUNT"
           echo "  - Files kept: $KEPT_COUNT"
           echo "=========================================="
@@ -173,6 +278,6 @@ jobs:
           echo "✅ BACKUP WORKFLOW COMPLETED SUCCESSFULLY!"
           echo "=========================================="
           echo "Backup file: ${BACKUP_FILE}"
-          echo "Upload location: ${{ secrets.S3_BUCKET }}/${BACKUP_FILE}"
+          echo "Upload location: ${{ secrets.S3_BUCKET }}/${S3_PATH}"
           echo "Timestamp: $(date)"
           echo "=========================================="
